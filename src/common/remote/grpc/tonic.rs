@@ -99,7 +99,7 @@ impl Tonic {
         }
 
         if let Some(http2_keep_alive_timeout) = grpc_config.http2_keep_alive_timeout {
-            endpoint = endpoint.http2_keep_alive_interval(http2_keep_alive_timeout);
+            endpoint = endpoint.keep_alive_timeout(http2_keep_alive_timeout);
         }
 
         if let Some(http2_keep_alive_while_idle) = grpc_config.http2_keep_alive_while_idle {
