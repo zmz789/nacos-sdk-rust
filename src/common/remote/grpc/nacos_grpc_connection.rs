@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
@@ -35,6 +35,19 @@ type DisconnectedListener = Arc<dyn Fn(String) + Send + Sync + 'static>;
 type HandlerMap = HashMap<String, Arc<dyn ServerRequestHandler>>;
 const MAX_RETRY: u32 = 6;
 
+const HEALTH_CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+const HEALTH_CHECK_RETRY_TIMES: u32 = 3;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn sleep_time(retry_count: u32) -> u32 {
     if retry_count > MAX_RETRY {
         1 << MAX_RETRY
@@ -56,6 +69,7 @@ where
     mk_service: M,
     state: State<M::Future, M::Service>,
     health: Arc<AtomicBool>,
+    last_active: Arc<AtomicU64>,
     connection_id: Option<String>,
     retry_count: u32,
     connection_id_watcher: (
@@ -98,6 +112,7 @@ where
             client_abilities,
             state: State::Idle,
             health: Arc::new(AtomicBool::new(false)),
+            last_active: Arc::new(AtomicU64::new(now_millis())),
             connection_id: None,
             retry_count: 0,
             connection_id_watcher,
@@ -153,9 +168,11 @@ where
         id: String,
     ) -> FailoverConnection<NacosGrpcConnection<M>> {
         let svc_health = self.health.clone();
-        FailoverConnection::new(id, self, svc_health)
+        let svc_last_active = self.last_active.clone();
+        FailoverConnection::new(id, self, svc_health, svc_last_active)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn init_connection(
         mut service: M::Service,
         client_version: String,
@@ -164,12 +181,14 @@ where
         client_abilities: NacosClientAbilities,
         handler_map: Arc<HandlerMap>,
         health: Arc<AtomicBool>,
+        last_active: Arc<AtomicU64>,
     ) -> Result<(M::Service, String), Error> {
         // setup
         let conn_id_sender = NacosGrpcConnection::<M>::setup(
             handler_map,
             &mut service,
             health,
+            last_active,
             client_version,
             namespace,
             labels,
@@ -208,10 +227,12 @@ where
         Ok((service, connection_id))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn setup(
         server_stream_handlers: Arc<HandlerMap>,
         service: &mut M::Service,
         health: Arc<AtomicBool>,
+        last_active: Arc<AtomicU64>,
         client_version: String,
         namespace: String,
         labels: HashMap<String, String>,
@@ -293,6 +314,7 @@ where
                 async {
                     let mut server_stream = Box::pin(server_stream);
                     while let Some(Ok(response)) = server_stream.next().await {
+                        last_active.store(now_millis(), Ordering::Release);
                         debug!("server stream receive message from server");
                         let Some(handler_key) = response
                             .metadata
@@ -348,10 +370,21 @@ where
         executor::spawn(service.call(grpc_call));
 
         tk.want();
-        let response = utils::convert(
-            utils::recv_response(rx.await, "grpc request callback failed")?,
-            "connection health check failed",
-        )?;
+        let response = match tokio::time::timeout(HEALTH_CHECK_REQUEST_TIMEOUT, rx).await {
+            Err(_) => {
+                warn!(
+                    "connection health check timeout after {:?}",
+                    HEALTH_CHECK_REQUEST_TIMEOUT
+                );
+                return Err(ErrResult(
+                    "connection health check request timeout".to_string(),
+                ));
+            }
+            Ok(resp) => utils::convert(
+                utils::recv_response(resp, "grpc request callback failed")?,
+                "connection health check failed",
+            )?,
+        };
 
         let response = GrpcMessage::<HealthCheckResponse>::from_payload(response);
         if let Err(e) = response {
@@ -475,6 +508,7 @@ where
                                 self.client_abilities.clone(),
                                 self.handler_map.clone(),
                                 self.health.clone(),
+                                self.last_active.clone(),
                             ));
                             self.state = State::Initializing(init_future);
                             continue;
@@ -519,6 +553,7 @@ where
 
                             self.retry_count = 0;
                             self.health.store(true, Ordering::Release);
+                            self.last_active.store(now_millis(), Ordering::Release);
                             self.is_initialized = true;
                             self.state = State::Connected(service);
                             self.connection_id = Some(connection_id);
@@ -599,9 +634,12 @@ where
                 let (cb, rx, mut tk) = utils::create_grpc_callback::<Result<Payload, Error>>();
                 let grpc_call = NacosGrpcCall::RequestService((req, cb));
                 let call_task = service.call(grpc_call).in_current_span();
+                let last_active = self.last_active.clone();
                 let response_fut = async move {
                     tk.want();
-                    utils::recv_response(rx.await, "sender has been drop")?
+                    let response = utils::recv_response(rx.await, "sender has been drop")?;
+                    last_active.store(now_millis(), Ordering::Release);
+                    response
                 }
                 .in_current_span();
                 executor::spawn(call_task);
@@ -660,7 +698,12 @@ where
     S: Service<Payload, Error = Error, Response = Payload> + Send + 'static,
     S::Future: Send + 'static,
 {
-    pub(crate) fn new(id: String, svc: S, svc_health: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        id: String,
+        svc: S,
+        svc_health: Arc<AtomicBool>,
+        svc_last_active: Arc<AtomicU64>,
+    ) -> Self {
         let (inner, work) = Buffer::pair(svc, 1024);
         executor::spawn(work);
 
@@ -672,6 +715,7 @@ where
                 inner.clone(),
                 active_health_check.clone(),
                 svc_health.clone(),
+                svc_last_active.clone(),
             )
             .instrument(debug_span!("health_check", id = id)),
         );
@@ -696,43 +740,76 @@ where
         mut svc: Buffer<Payload, S::Future>,
         active_health_check: Arc<AtomicBool>,
         svc_health: Arc<AtomicBool>,
+        last_active: Arc<AtomicU64>,
     ) {
         while active_health_check.load(Ordering::Acquire) {
             debug!("health check.");
-            let Ok(health_check_request) = GrpcMessageBuilder::new(HealthCheckRequest::default())
-                .build()
-                .into_payload()
-            else {
-                error!("health check failed, grpc message can not convert to payload. retry.");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            };
-            let ready = futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
-                .in_current_span()
-                .await;
-            if ready.is_err() {
-                warn!("connection not ready, wait.");
-                sleep(Duration::from_secs(5)).await;
+
+            // only probe when the connection has been idle for a full interval
+            let idle_millis = now_millis().saturating_sub(last_active.load(Ordering::Acquire));
+            if idle_millis < HEALTH_CHECK_INTERVAL.as_millis() as u64 {
+                sleep(HEALTH_CHECK_INTERVAL).await;
                 continue;
             }
 
-            let Ok(response) = svc.call(health_check_request).in_current_span().await else {
+            let mut healthy = false;
+            for attempt in 0..HEALTH_CHECK_RETRY_TIMES {
+                if attempt > 0 {
+                    let jitter = Duration::from_millis(rand::random_range(..500_u64));
+                    sleep(jitter).await;
+                }
+
+                let Ok(health_check_request) =
+                    GrpcMessageBuilder::new(HealthCheckRequest::default())
+                        .build()
+                        .into_payload()
+                else {
+                    error!("health check failed, grpc message can not convert to payload. retry.");
+                    break;
+                };
+
+                let ready = futures_util::future::poll_fn(|cx| svc.poll_ready(cx))
+                    .in_current_span()
+                    .await;
+                if ready.is_err() {
+                    warn!("connection not ready, wait.");
+                    break;
+                }
+
+                let call_result = tokio::time::timeout(
+                    HEALTH_CHECK_REQUEST_TIMEOUT,
+                    svc.call(health_check_request).in_current_span(),
+                )
+                .await;
+
+                match call_result {
+                    Err(_) => {
+                        error!(
+                            "health check failed, request timeout after {:?}, retry.",
+                            HEALTH_CHECK_REQUEST_TIMEOUT
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        error!("health check failed, send health check request failed, retry. {e}");
+                    }
+                    Ok(Ok(response)) => {
+                        if GrpcMessage::<HealthCheckResponse>::from_payload(response).is_ok() {
+                            healthy = true;
+                            break;
+                        }
+                        error!("health check failed, error response, retry.");
+                    }
+                }
+            }
+
+            if healthy {
+                last_active.store(now_millis(), Ordering::Release);
+            } else {
                 let _ =
                     svc_health.compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire);
-                error!("health check failed, send health check request failed, retry.");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            };
+            }
 
-            let Ok(_) = GrpcMessage::<HealthCheckResponse>::from_payload(response) else {
-                let _ =
-                    svc_health.compare_exchange(true, false, Ordering::SeqCst, Ordering::Acquire);
-                error!("health check failed, error response, retry.");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            };
-
-            sleep(Duration::from_secs(5)).await;
+            sleep(HEALTH_CHECK_INTERVAL).await;
         }
 
         warn!("stop health check task.");
